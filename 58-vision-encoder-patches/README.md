@@ -80,7 +80,7 @@ cd 58-vision-encoder-patches
 ```
 
 `verify.sh` creates an ignored `.venv`, installs `numpy==2.5.5` and
-`mypy==2.4.1`, runs the 13 tests, runs mypy, and executes the demo. It is safe
+`mypy==2.4.1`, runs the 19 tests, runs mypy, and executes the demo. It is safe
 to run repeatedly.
 
 Run the pieces directly after the first verification:
@@ -101,7 +101,7 @@ patches, and the output is `(1, 197, 768)`.
 Everything in the lesson runs offline after the first dependency install:
 
 - fixture synthesis, patch projection, position construction, and the front end;
-- all 13 unit tests (no network, no sleeps, no external fixtures);
+- all 19 unit tests (no network, no sleeps, no external fixtures);
 - the demo and latency measurement;
 - mypy over `code/`.
 
@@ -140,7 +140,7 @@ Measured locally with the pinned environment on CPU. Latency is machine- and
 BLAS-dependent, varied between the two verification runs, and is not a
 benchmark claim.
 
-- `./verify.sh`: **13 tests passed** (`Ran 13 tests`, `OK`); mypy reported
+- `./verify.sh`: **19 tests passed** (`Ran 19 tests`, `OK`); mypy reported
   `Success: no issues found in 3 source files`; demo exited 0.
 - Demo image shape: `(1, 3, 224, 224)`
 - Patch grid: `14 x 14 = 196`
