@@ -133,3 +133,39 @@ adding behavior to this lesson.
   normalized by the front end. Both are the caller's responsibility.
 - The implementation is single-process CPU NumPy. It favors clarity and
   deterministic verification over GPU throughput.
+
+## Measured results
+
+Measured locally with the pinned environment on CPU. Latency is machine- and
+BLAS-dependent, varied between the two verification runs, and is not a
+benchmark claim.
+
+- `./verify.sh`: **13 tests passed** (`Ran 13 tests`, `OK`); mypy reported
+  `Success: no issues found in 3 source files`; demo exited 0.
+- Demo image shape: `(1, 3, 224, 224)`
+- Patch grid: `14 x 14 = 196`
+- Token shape: `(1, 197, 768)`
+- CLS norm: `0.541106`
+- Position table norm range: `min=19.595919`, `max=19.595919` (uniform, as
+  predicted by the sin/cos pairs)
+- Position row `0` first eight values: `[0.000000 1.000000 0.000000 1.000000
+  0.000000 1.000000 0.000000 1.000000]` (the origin token, where `sin(0)=0` and
+  `cos(0)=1`)
+- Batch-1 forward median over 7 timed runs after warm-up: `3.907 ms` on the
+  first run, `1.697 ms` on the second
+- Parameter check: projection `590,592`, CLS `768`, total `591,360`, fixed
+  position table `0`
+
+## References
+
+Sources read and used for this implementation and its documentation:
+
+1. [Vision Encoder Patches capstone spec](https://aiengineeringfromscratch.com/learn/capstone-projects/vision-encoder-patches) — task framing, required classes, 224/16/768 geometry, CLS/position table, test expectations.
+2. [An Image is Worth 16x16 Words (ViT)](https://arxiv.org/abs/2010.11929) — patch projection as the front end, CLS token, and 2D position embeddings.
+3. [Attention Is All You Need](https://arxiv.org/abs/1706.03762) — the sinusoidal sin/cos formula adapted here to row and column coordinates.
+4. [DINOv2 `patch_embed.py`](https://github.com/facebookresearch/dinov2/blob/main/dinov2/layers/patch_embed.py) — production shape of a patch embedder: `Conv2d(kernel=patch, stride=patch)`, flatten, transpose.
+5. [NumPy `sliding_window_view` documentation](https://numpy.org/doc/stable/reference/generated/numpy.lib.stride_tricks.sliding_window_view.html) — the im2col-style view used by the convolution and unfold implementations.
+
+## License
+
+MIT © 2026 Pedro Monteiro. See [LICENSE](LICENSE).
