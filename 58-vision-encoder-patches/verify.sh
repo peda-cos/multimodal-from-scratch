@@ -10,6 +10,6 @@ fi
 
 uv pip install --python .venv/bin/python -r requirements.txt
 
-.venv/bin/python -m unittest code/test_main.py -v
+.venv/bin/python -m unittest discover -s code -p 'test_*.py' -v
 .venv/bin/python -m mypy code
 .venv/bin/python code/main.py

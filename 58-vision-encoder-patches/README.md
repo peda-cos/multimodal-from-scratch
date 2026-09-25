@@ -86,7 +86,7 @@ to run repeatedly.
 Run the pieces directly after the first verification:
 
 ```bash
-.venv/bin/python -m unittest code/test_main.py -v
+.venv/bin/python -m unittest discover -s code -p 'test_*.py' -v
 .venv/bin/python code/main.py
 ```
 
@@ -141,7 +141,7 @@ BLAS-dependent, varied between the two verification runs, and is not a
 benchmark claim.
 
 - `./verify.sh`: **19 tests passed** (`Ran 19 tests`, `OK`); mypy reported
-  `Success: no issues found in 3 source files`; demo exited 0.
+  `Success: no issues found in 5 source files`; demo exited 0.
 - Demo image shape: `(1, 3, 224, 224)`
 - Patch grid: `14 x 14 = 196`
 - Token shape: `(1, 197, 768)`
