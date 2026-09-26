@@ -29,8 +29,14 @@ __all__ = [
     "LayerNorm",
     "gelu",
     "gelu_grad",
+    "MultiHeadSelfAttention",
+    "FeedForward",
+    "Block",
+    "ViT",
+    "VisionEncoder",
     "sinusoidal_2d",
     "synthesize_image",
+    "demo",
 ]
 
 
@@ -141,7 +147,7 @@ class Conv2d(Module):
             batch * out_h * out_w, self.out_channels
         )
         columns = self._columns.reshape(batch * out_h * out_w, -1)
-        self.weight_grad += flat.T @ columns
+        self.weight_grad += (flat.T @ columns).reshape(self.weight.shape)
         self.bias_grad += flat.sum(axis=0)
 
         dcolumns = (flat @ self.weight.reshape(self.out_channels, -1)).reshape(
@@ -468,6 +474,312 @@ class LayerNorm(Module):
         self.beta_grad.fill(0.0)
 
 
+class MultiHeadSelfAttention(Module):
+    """Bidirectional multi-head self-attention with a fused QKV projection."""
+
+    def __init__(self, hidden: int, heads: int, seed: int = 0) -> None:
+        if hidden <= 0 or heads <= 0:
+            raise ValueError("hidden and heads must be positive")
+        if hidden % heads != 0:
+            raise ValueError(
+                f"hidden={hidden} must be divisible by heads={heads}"
+            )
+        self.hidden = hidden
+        self.heads = heads
+        self.head_dim = hidden // heads
+        self.scale = float(self.head_dim) ** -0.5
+        self.qkv = Linear(hidden, 3 * hidden, seed=seed)
+        self.proj = Linear(hidden, hidden, seed=seed + 1)
+        self._q: np.ndarray | None = None
+        self._k: np.ndarray | None = None
+        self._v: np.ndarray | None = None
+        self._probs: np.ndarray | None = None
+
+    def forward_with_weights(
+        self, x: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        x = np.asarray(x, dtype=np.float32)
+        if x.ndim != 3 or x.shape[-1] != self.hidden or x.shape[1] == 0:
+            raise ValueError(
+                f"expected (batch, seq, {self.hidden}) with seq > 0, got {x.shape}"
+            )
+        batch, seq, _ = x.shape
+        qkv = self.qkv.forward(x)
+        qkv = qkv.reshape(batch, seq, 3, self.heads, self.head_dim).transpose(
+            2, 0, 3, 1, 4
+        )
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale
+        scores = scores - scores.max(axis=-1, keepdims=True)
+        exp_scores = np.exp(scores)
+        probs = exp_scores / exp_scores.sum(axis=-1, keepdims=True)
+        context = (probs @ v).transpose(0, 2, 1, 3).reshape(batch, seq, self.hidden)
+        out = self.proj.forward(context)
+
+        self._q, self._k, self._v, self._probs = q, k, v, probs
+        return out, probs
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        return self.forward_with_weights(x)[0]
+
+    def backward(self, dy: np.ndarray) -> np.ndarray:
+        if (
+            self._q is None
+            or self._k is None
+            or self._v is None
+            or self._probs is None
+        ):
+            raise RuntimeError("forward() must run before backward()")
+        d_context = self.proj.backward(dy)
+        batch, seq, _ = d_context.shape
+        d_context = d_context.reshape(
+            batch, seq, self.heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
+
+        d_probs = d_context @ self._v.transpose(0, 1, 3, 2)
+        d_v = self._probs.transpose(0, 1, 3, 2) @ d_context
+        d_scores = self._probs * (
+            d_probs - (d_probs * self._probs).sum(axis=-1, keepdims=True)
+        )
+        d_q = (d_scores @ self._k) * self.scale
+        d_k = (d_scores.transpose(0, 1, 3, 2) @ self._q) * self.scale
+
+        def flatten_heads(value: np.ndarray) -> np.ndarray:
+            return value.transpose(0, 2, 1, 3).reshape(batch, seq, self.hidden)
+
+        d_qkv = np.concatenate(
+            (flatten_heads(d_q), flatten_heads(d_k), flatten_heads(d_v)), axis=-1
+        )
+        return self.qkv.backward(d_qkv)
+
+    def parameters(self) -> list[np.ndarray]:
+        return self.qkv.parameters() + self.proj.parameters()
+
+    def zero_grad(self) -> None:
+        self.qkv.zero_grad()
+        self.proj.zero_grad()
+
+
+class FeedForward(Module):
+    """4x-expansion GELU MLP used inside each transformer block."""
+
+    def __init__(
+        self, hidden: int, expansion: int = 4, seed: int = 0
+    ) -> None:
+        if hidden <= 0 or expansion <= 0:
+            raise ValueError("hidden and expansion must be positive")
+        self.hidden = hidden
+        self.expansion = expansion
+        self.fc1 = Linear(hidden, expansion * hidden, seed=seed)
+        self.fc2 = Linear(expansion * hidden, hidden, seed=seed + 1)
+        self._pre_activation: np.ndarray | None = None
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        self._pre_activation = self.fc1.forward(x)
+        activated = gelu(self._pre_activation)
+        return self.fc2.forward(activated)
+
+    def backward(self, dy: np.ndarray) -> np.ndarray:
+        if self._pre_activation is None:
+            raise RuntimeError("forward() must run before backward()")
+        d_activated = self.fc2.backward(dy)
+        d_pre = d_activated * gelu_grad(self._pre_activation)
+        return self.fc1.backward(d_pre)
+
+    def parameters(self) -> list[np.ndarray]:
+        return self.fc1.parameters() + self.fc2.parameters()
+
+    def zero_grad(self) -> None:
+        self.fc1.zero_grad()
+        self.fc2.zero_grad()
+
+
+class Block(Module):
+    """Pre-LN transformer block: attention residual, then FFN residual."""
+
+    def __init__(
+        self,
+        hidden: int,
+        heads: int,
+        expansion: int = 4,
+        seed: int = 0,
+    ) -> None:
+        self.hidden = hidden
+        self.norm1 = LayerNorm(hidden)
+        self.attn = MultiHeadSelfAttention(hidden, heads, seed=seed)
+        self.norm2 = LayerNorm(hidden)
+        self.ffn = FeedForward(hidden, expansion=expansion, seed=seed + 1)
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32)
+        if x.ndim != 3 or x.shape[-1] != self.hidden:
+            raise ValueError(
+                f"expected (batch, seq, {self.hidden}), got {x.shape}"
+            )
+        attn_out = self.attn.forward(self.norm1.forward(x))
+        after_attn = x + attn_out
+        ffn_out = self.ffn.forward(self.norm2.forward(after_attn))
+        return after_attn + ffn_out
+
+    def backward(self, dy: np.ndarray) -> np.ndarray:
+        d_ffn = self.ffn.backward(dy)
+        d_after_attn = dy + self.norm2.backward(d_ffn)
+        d_attn = self.attn.backward(d_after_attn)
+        return d_after_attn + self.norm1.backward(d_attn)
+
+    def parameters(self) -> list[np.ndarray]:
+        return (
+            self.norm1.parameters()
+            + self.attn.parameters()
+            + self.norm2.parameters()
+            + self.ffn.parameters()
+        )
+
+    def zero_grad(self) -> None:
+        self.norm1.zero_grad()
+        self.attn.zero_grad()
+        self.norm2.zero_grad()
+        self.ffn.zero_grad()
+
+
+class ViT(Module):
+    """Stack of pre-LN blocks followed by a final LayerNorm."""
+
+    def __init__(
+        self,
+        hidden: int = 768,
+        depth: int = 12,
+        heads: int = 12,
+        expansion: int = 4,
+        seed: int = 0,
+    ) -> None:
+        if hidden <= 0:
+            raise ValueError("hidden must be positive")
+        if depth <= 0:
+            raise ValueError("depth must be positive")
+        self.hidden = hidden
+        self.depth = depth
+        self.blocks = [
+            Block(hidden, heads, expansion=expansion, seed=seed + 1000 + index)
+            for index in range(depth)
+        ]
+        self.norm = LayerNorm(hidden)
+        self.cls_history: list[np.ndarray] = []
+
+    def forward(self, tokens: np.ndarray) -> np.ndarray:
+        x = np.asarray(tokens, dtype=np.float32)
+        if x.ndim != 3 or x.shape[-1] != self.hidden or x.shape[1] == 0:
+            raise ValueError(
+                f"expected (batch, seq, {self.hidden}) with seq > 0, got {x.shape}"
+            )
+        history: list[np.ndarray] = []
+        for block in self.blocks:
+            x = block.forward(x)
+            history.append(x[:, 0, :].copy())
+        out = self.norm.forward(x)
+        history.append(out[:, 0, :].copy())
+        self.cls_history = history
+        return out
+
+    def backward(self, dout: np.ndarray) -> np.ndarray:
+        d_tokens = self.norm.backward(dout)
+        for block in reversed(self.blocks):
+            d_tokens = block.backward(d_tokens)
+        return d_tokens
+
+    def parameters(self) -> list[np.ndarray]:
+        parameters: list[np.ndarray] = []
+        for block in self.blocks:
+            parameters.extend(block.parameters())
+        parameters.extend(self.norm.parameters())
+        return parameters
+
+    def zero_grad(self) -> None:
+        for block in self.blocks:
+            block.zero_grad()
+        self.norm.zero_grad()
+
+
+class VisionEncoder(Module):
+    """Patch front end wired to the ViT stack, returning tokens and CLS."""
+
+    def __init__(
+        self,
+        patch_size: int = 16,
+        hidden: int = 768,
+        depth: int = 12,
+        heads: int = 12,
+        expansion: int = 4,
+        in_channels: int = 3,
+        seed: int = 0,
+    ) -> None:
+        self.hidden = hidden
+        self.front_end = VisionFrontEnd(
+            patch_size=patch_size,
+            hidden=hidden,
+            in_channels=in_channels,
+            seed=seed,
+        )
+        self.vit = ViT(
+            hidden=hidden,
+            depth=depth,
+            heads=heads,
+            expansion=expansion,
+            seed=seed,
+        )
+        self._tokens: np.ndarray | None = None
+
+    def forward(
+        self, image: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        embedded = self.front_end.forward(image)
+        tokens = self.vit.forward(embedded)
+        self._tokens = tokens
+        return tokens, tokens[:, 0, :]
+
+    def backward(self, d_pooled: np.ndarray) -> np.ndarray:
+        if self._tokens is None:
+            raise RuntimeError("forward() must run before backward()")
+        d_pooled = np.asarray(d_pooled, dtype=np.float32)
+        if d_pooled.shape != (self._tokens.shape[0], self.hidden):
+            raise ValueError(
+                f"expected pooled gradient shape "
+                f"{(self._tokens.shape[0], self.hidden)}, got {d_pooled.shape}"
+            )
+        d_tokens = np.zeros_like(self._tokens)
+        d_tokens[:, 0, :] = d_pooled
+        d_embedded = self.vit.backward(d_tokens)
+        return self.front_end.backward(d_embedded)
+
+    def parameters(self) -> list[np.ndarray]:
+        return self.front_end.parameters() + self.vit.parameters()
+
+    def zero_grad(self) -> None:
+        self.front_end.zero_grad()
+        self.vit.zero_grad()
+
+
+def demo() -> None:
+    """Run one fixture through the default ViT-Base/16 encoder."""
+    image = synthesize_image(seed=7)
+    model = VisionEncoder()
+    started = perf_counter()
+    tokens, pooled = model(image)
+    elapsed = perf_counter() - started
+
+    print(f"input shape: {image.shape}")
+    print(f"output shape: {tokens.shape}")
+    print(f"parameters: {model.num_parameters():,}")
+    print(f"single forward: {elapsed:.3f} s")
+    print("CLS norm by depth:")
+    for index in range(0, model.vit.depth, 2):
+        norm = float(np.linalg.norm(model.vit.cls_history[index]))
+        print(f"  after block {index + 1}: {norm:.6f}")
+    final_norm = float(np.linalg.norm(model.vit.cls_history[-1]))
+    print(f"  after final LayerNorm: {final_norm:.6f}")
+    print(f"pooled CLS shape: {pooled.shape}")
+
+
 def synthesize_image(
     seed: int = 0,
     size: int = 224,
@@ -479,3 +791,7 @@ def synthesize_image(
     rng = np.random.default_rng(seed)
     image = rng.random((size, size, in_channels), dtype=np.float32)
     return image.transpose(2, 0, 1)[None, :, :, :]
+
+
+if __name__ == "__main__":
+    demo()
