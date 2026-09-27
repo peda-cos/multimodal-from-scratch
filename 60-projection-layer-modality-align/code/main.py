@@ -17,8 +17,10 @@ import numpy as np
 
 __all__ = [
     "CAPTION_LEN",
+    "MLPProjector",
     "NUM_TOKENS",
     "PROJECTION_HIDDEN",
+    "PROJECTION_SEED",
     "TEXT_HIDDEN",
     "TEXT_SEED",
     "Parameter",
@@ -27,6 +29,9 @@ __all__ = [
     "VISION_HIDDEN",
     "VISION_SEED",
     "VOCAB_SIZE",
+    "gelu",
+    "gelu_grad",
+    "sgd_step",
 ]
 
 VISION_HIDDEN = 768
@@ -152,3 +157,118 @@ class MockVisionEncoder:
         tokens = concept[None, :] + 0.05 * noise
         tokens[0] = concept + 0.01 * noise[0]
         return tokens.astype(np.float32, copy=False)
+
+
+def gelu(x: np.ndarray) -> np.ndarray:
+    """Tanh-approximated GELU used between the two linear layers."""
+    inner = np.sqrt(2.0 / np.pi) * (x + 0.044715 * x**3)
+    return 0.5 * x * (1.0 + np.tanh(inner))
+
+
+def gelu_grad(x: np.ndarray) -> np.ndarray:
+    """Derivative of the tanh-approximated GELU."""
+    scale = np.sqrt(2.0 / np.pi)
+    inner = scale * (x + 0.044715 * x**3)
+    tanh_inner = np.tanh(inner)
+    return (
+        0.5 * (1.0 + tanh_inner)
+        + 0.5 * x * (1.0 - tanh_inner**2) * scale * (1.0 + 3.0 * 0.044715 * x**2)
+    )
+
+
+class MLPProjector:
+    """Two-layer linear-GELU-linear projector with a manual backward pass."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        seed: int = PROJECTION_SEED,
+    ) -> None:
+        if in_dim <= 0 or hidden_dim <= 0 or out_dim <= 0:
+            raise ValueError("projector dimensions must be positive")
+        rng = np.random.default_rng(seed)
+        bound_1 = 1.0 / sqrt(in_dim)
+        bound_2 = 1.0 / sqrt(hidden_dim)
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+        self.seed = seed
+        self.fc1 = Parameter(
+            rng.uniform(-bound_1, bound_1, (hidden_dim, in_dim)).astype(np.float32),
+            np.zeros((hidden_dim, in_dim), dtype=np.float32),
+        )
+        self.b1 = Parameter(
+            rng.uniform(-bound_1, bound_1, hidden_dim).astype(np.float32),
+            np.zeros(hidden_dim, dtype=np.float32),
+        )
+        self.fc2 = Parameter(
+            rng.uniform(-bound_2, bound_2, (out_dim, hidden_dim)).astype(np.float32),
+            np.zeros((out_dim, hidden_dim), dtype=np.float32),
+        )
+        self.b2 = Parameter(
+            rng.uniform(-bound_2, bound_2, out_dim).astype(np.float32),
+            np.zeros(out_dim, dtype=np.float32),
+        )
+        self._cache: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+
+    def parameters(self) -> list[Parameter]:
+        return [self.fc1, self.b1, self.fc2, self.b2]
+
+    def num_parameters(self) -> int:
+        return sum(int(parameter.data.size) for parameter in self.parameters())
+
+    def zero_grad(self) -> None:
+        for parameter in self.parameters():
+            parameter.zero_grad()
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        return self.forward(x)
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        """Project ``(B, in_dim)`` features to ``(B, out_dim)``."""
+        features = np.asarray(x, dtype=np.float32)
+        if features.ndim != 2:
+            raise ValueError(f"expected a 2-D input, got shape {features.shape}")
+        if features.shape[0] == 0:
+            raise ValueError("projector input batch must not be empty")
+        if features.shape[1] != self.in_dim:
+            raise ValueError(
+                f"expected {self.in_dim} input features, got {features.shape[1]}"
+            )
+        hidden = features @ self.fc1.data.T + self.b1.data
+        activated = gelu(hidden)
+        output = activated @ self.fc2.data.T + self.b2.data
+        self._cache = (features, hidden, activated)
+        return output
+
+    def backward(self, dout: np.ndarray) -> np.ndarray:
+        """Backpropagate ``dL/dout`` and return ``dL/dinput``."""
+        if self._cache is None:
+            raise RuntimeError("call forward() before backward()")
+        features, hidden, activated = self._cache
+        gradient = np.asarray(dout, dtype=np.float32)
+        expected = (features.shape[0], self.out_dim)
+        if gradient.shape != expected:
+            raise ValueError(
+                f"expected an upstream gradient of shape {expected}, "
+                f"got {gradient.shape}"
+            )
+
+        self.fc2.grad += gradient.T @ activated
+        self.b2.grad += gradient.sum(axis=0)
+        d_activated = gradient @ self.fc2.data
+        d_hidden = d_activated * gelu_grad(hidden)
+        self.fc1.grad += d_hidden.T @ features
+        self.b1.grad += d_hidden.sum(axis=0)
+        return d_hidden @ self.fc1.data
+
+
+def sgd_step(projector: MLPProjector, lr: float) -> None:
+    """Apply one plain SGD update to every trainable projector parameter."""
+    if lr <= 0.0:
+        raise ValueError("learning rate must be positive")
+    for parameter in projector.parameters():
+        if parameter.requires_grad:
+            parameter.data -= lr * parameter.grad
