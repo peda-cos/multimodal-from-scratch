@@ -29,8 +29,14 @@ __all__ = [
     "VISION_HIDDEN",
     "VISION_SEED",
     "VOCAB_SIZE",
+    "cls_pool",
+    "cosine_alignment_grad",
+    "cosine_alignment_loss",
+    "cosine_alignment_loss_and_grad",
+    "cosine_similarity",
     "gelu",
     "gelu_grad",
+    "make_pair",
     "sgd_step",
 ]
 
@@ -272,3 +278,112 @@ def sgd_step(projector: MLPProjector, lr: float) -> None:
     for parameter in projector.parameters():
         if parameter.requires_grad:
             parameter.data -= lr * parameter.grad
+
+
+def cls_pool(tokens: np.ndarray) -> np.ndarray:
+    """Take the first (CLS) token from ``(B, N, D)`` image tokens."""
+    token_batch = np.asarray(tokens, dtype=np.float32)
+    if token_batch.ndim != 3:
+        raise ValueError(f"expected a 3-D token batch, got {token_batch.shape}")
+    if token_batch.shape[0] == 0 or token_batch.shape[1] == 0:
+        raise ValueError("token batch must have a batch and a sequence dimension")
+    return token_batch[:, 0, :]
+
+
+def make_pair(
+    seed: int,
+    vocab_size: int,
+    *,
+    text_table: MockTextEmbedding | None = None,
+    vision_encoder: MockVisionEncoder | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Synthesize one paired ``(image_tokens, caption_ids)`` sample.
+
+    The image CLS token is a frozen random projection of the caption embedding
+    plus small noise. This is a deterministic fixture for the alignment
+    mechanism, not a real image-encoder output.
+    """
+    if vocab_size <= 0:
+        raise ValueError("vocab_size must be positive")
+    table = (
+        text_table
+        if text_table is not None
+        else MockTextEmbedding(vocab_size, TEXT_HIDDEN, seed=TEXT_SEED)
+    )
+    encoder = (
+        vision_encoder
+        if vision_encoder is not None
+        else MockVisionEncoder(
+            TEXT_HIDDEN, VISION_HIDDEN, NUM_TOKENS, seed=VISION_SEED
+        )
+    )
+    if table.dim != encoder.text_dim:
+        raise ValueError("text table and vision encoder dimensions differ")
+    if vocab_size > table.vocab_size:
+        raise ValueError("vocab_size exceeds the shared text table")
+
+    rng = np.random.default_rng(seed)
+    caption_ids = rng.choice(vocab_size, CAPTION_LEN, replace=False)
+    caption = table.caption_embedding(caption_ids)
+    image_tokens = encoder.encode(caption, noise_seed=seed)
+    return image_tokens, caption_ids
+
+
+def _as_batch_pair(
+    image_emb: np.ndarray, text_emb: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    image = np.asarray(image_emb, dtype=np.float32)
+    text = np.asarray(text_emb, dtype=np.float32)
+    if image.ndim == 1:
+        image = image[None, :]
+    if text.ndim == 1:
+        text = text[None, :]
+    if image.ndim != 2 or text.ndim != 2:
+        raise ValueError("embeddings must be 1-D or 2-D")
+    if image.shape != text.shape:
+        raise ValueError(
+            f"image and text embeddings must share a shape, got "
+            f"{image.shape} and {text.shape}"
+        )
+    if image.shape[0] == 0 or image.shape[1] == 0:
+        raise ValueError("embeddings must have a batch and a feature dimension")
+    return image, text
+
+
+def cosine_similarity(image_emb: np.ndarray, text_emb: np.ndarray) -> np.ndarray:
+    """Return the per-pair cosine similarity for matching rows."""
+    image, text = _as_batch_pair(image_emb, text_emb)
+    image_norm = np.maximum(np.linalg.norm(image, axis=1, keepdims=True), 1e-12)
+    text_norm = np.maximum(np.linalg.norm(text, axis=1, keepdims=True), 1e-12)
+    return np.sum((image / image_norm) * (text / text_norm), axis=1)
+
+
+def cosine_alignment_loss_and_grad(
+    image_emb: np.ndarray, text_emb: np.ndarray
+) -> tuple[float, np.ndarray]:
+    """Return the mean ``1 - cos`` loss and its gradient w.r.t. image rows."""
+    image, text = _as_batch_pair(image_emb, text_emb)
+    image_norm = np.maximum(np.linalg.norm(image, axis=1, keepdims=True), 1e-12)
+    text_norm = np.maximum(np.linalg.norm(text, axis=1, keepdims=True), 1e-12)
+    image_hat = image / image_norm
+    text_hat = text / text_norm
+    cosine = np.sum(image_hat * text_hat, axis=1)
+    loss = float(np.mean(1.0 - cosine))
+    gradient = (
+        -(text_hat - cosine[:, None] * image_hat)
+        / image_norm
+        / image.shape[0]
+    )
+    return loss, gradient
+
+
+def cosine_alignment_loss(image_emb: np.ndarray, text_emb: np.ndarray) -> float:
+    """Mean per-pair cosine alignment objective."""
+    loss, _ = cosine_alignment_loss_and_grad(image_emb, text_emb)
+    return loss
+
+
+def cosine_alignment_grad(image_emb: np.ndarray, text_emb: np.ndarray) -> np.ndarray:
+    """Gradient of ``cosine_alignment_loss`` with respect to image rows."""
+    _, gradient = cosine_alignment_loss_and_grad(image_emb, text_emb)
+    return gradient
