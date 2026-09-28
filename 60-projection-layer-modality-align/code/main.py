@@ -26,6 +26,7 @@ __all__ = [
     "Parameter",
     "MockTextEmbedding",
     "MockVisionEncoder",
+    "TrainingReport",
     "VISION_HIDDEN",
     "VISION_SEED",
     "VOCAB_SIZE",
@@ -36,8 +37,10 @@ __all__ = [
     "cosine_similarity",
     "gelu",
     "gelu_grad",
+    "demo",
     "make_pair",
     "sgd_step",
+    "train",
 ]
 
 VISION_HIDDEN = 768
@@ -387,3 +390,166 @@ def cosine_alignment_grad(image_emb: np.ndarray, text_emb: np.ndarray) -> np.nda
     """Gradient of ``cosine_alignment_loss`` with respect to image rows."""
     _, gradient = cosine_alignment_loss_and_grad(image_emb, text_emb)
     return gradient
+
+
+@dataclass(frozen=True)
+class TrainingReport:
+    """Full-dataset metrics captured at a training step."""
+
+    step: int
+    loss: float
+    mean_cosine: float
+
+
+def train(
+    projector: MLPProjector,
+    pairs: list[tuple[np.ndarray, np.ndarray]],
+    text_table: MockTextEmbedding,
+    *,
+    steps: int = 200,
+    batch_size: int = 8,
+    lr: float = 0.1,
+    report_every: int = 25,
+    verbose: bool = False,
+) -> list[TrainingReport]:
+    """Train only the projector on cycled synthetic pairs."""
+    if not pairs:
+        raise ValueError("at least one pair is required")
+    if steps <= 0 or batch_size <= 0 or report_every <= 0 or lr <= 0.0:
+        raise ValueError("steps, batch_size, report_every, and lr must be positive")
+
+    images = cls_pool(np.stack([image_tokens for image_tokens, _ in pairs]))
+    texts = np.stack(
+        [text_table.caption_embedding(caption_ids) for _, caption_ids in pairs]
+    )
+    if images.shape[1] != projector.in_dim:
+        raise ValueError(
+            f"image token width {images.shape[1]} does not match "
+            f"projector input {projector.in_dim}"
+        )
+    if texts.shape[1] != projector.out_dim:
+        raise ValueError(
+            f"text embedding width {texts.shape[1]} does not match "
+            f"projector output {projector.out_dim}"
+        )
+
+    def make_report(step: int) -> TrainingReport:
+        projected = projector(images)
+        similarities = cosine_similarity(projected, texts)
+        loss = float(np.mean(1.0 - similarities))
+        mean_cosine = float(np.mean(similarities))
+        if verbose:
+            print(
+                f"step {step:3d} | loss {loss:.4f} | "
+                f"mean cosine {mean_cosine:+.4f}"
+            )
+        return TrainingReport(step=step, loss=loss, mean_cosine=mean_cosine)
+
+    history = [make_report(0)]
+    for step in range(1, steps + 1):
+        indices = (
+            (step - 1) * batch_size + np.arange(batch_size)
+        ) % len(pairs)
+        projector.zero_grad()
+        projected = projector(images[indices])
+        _, gradient = cosine_alignment_loss_and_grad(projected, texts[indices])
+        projector.backward(gradient)
+        sgd_step(projector, lr)
+        if step % report_every == 0 or step == steps:
+            history.append(make_report(step))
+    return history
+
+
+def demo() -> None:
+    """Run the 32-pair, 200-step projection alignment demonstration."""
+    table = MockTextEmbedding(VOCAB_SIZE, TEXT_HIDDEN, seed=TEXT_SEED)
+    encoder = MockVisionEncoder(
+        TEXT_HIDDEN, VISION_HIDDEN, NUM_TOKENS, seed=VISION_SEED
+    )
+    pairs = [
+        make_pair(seed, VOCAB_SIZE, text_table=table, vision_encoder=encoder)
+        for seed in range(32)
+    ]
+    projector = MLPProjector(
+        VISION_HIDDEN, PROJECTION_HIDDEN, TEXT_HIDDEN, seed=PROJECTION_SEED
+    )
+    trainable = sum(
+        int(parameter.data.size)
+        for parameter in projector.parameters()
+        if parameter.requires_grad
+    )
+    frozen_table = sum(
+        int(parameter.data.size) for parameter in table.parameters()
+    )
+    frozen_encoder = sum(
+        int(parameter.data.size) for parameter in encoder.parameters()
+    )
+
+    print("projection layer: 768 -> 1024 -> 512")
+    print(f"trainable projector parameters: {trainable:,}")
+    print(f"frozen text table parameters: {frozen_table:,} (requires_grad=False)")
+    print(
+        f"frozen vision bridge parameters: {frozen_encoder:,} "
+        "(requires_grad=False)"
+    )
+    print("pairs: 32, steps: 200, batch: 8, lr: 0.1, optimizer: SGD")
+
+    table_before = table.table.copy()
+    encoder_before = encoder.projection.data.copy()
+    tokens_before = [image_tokens.copy() for image_tokens, _ in pairs]
+    projector_before = [
+        parameter.data.copy() for parameter in projector.parameters()
+    ]
+
+    reports = train(
+        projector,
+        pairs,
+        table,
+        steps=200,
+        batch_size=8,
+        lr=0.1,
+        report_every=25,
+        verbose=True,
+    )
+
+    images = cls_pool(np.stack([image_tokens for image_tokens, _ in pairs]))
+    texts = np.stack(
+        [table.caption_embedding(caption_ids) for _, caption_ids in pairs]
+    )
+    final_cosine = cosine_similarity(projector(images), texts)
+    print(f"loss: {reports[0].loss:.4f} -> {reports[-1].loss:.4f}")
+    print(
+        f"mean cosine: {reports[0].mean_cosine:+.4f} -> "
+        f"{reports[-1].mean_cosine:+.4f}"
+    )
+    print(
+        "final cosine per pair:",
+        np.array2string(final_cosine, precision=2, separator=", "),
+    )
+    print(f"final mean cosine: {float(np.mean(final_cosine)):+.4f}")
+    print(
+        "frozen text table unchanged:",
+        bool(np.array_equal(table.table, table_before)),
+    )
+    print(
+        "frozen vision bridge unchanged:",
+        bool(np.array_equal(encoder.projection.data, encoder_before)),
+    )
+    print(
+        "frozen image tokens unchanged:",
+        all(
+            np.array_equal(before, after)
+            for before, (after, _) in zip(tokens_before, pairs, strict=True)
+        ),
+    )
+    print(
+        "projector parameters changed:",
+        any(
+            not np.array_equal(before, parameter.data)
+            for before, parameter in zip(projector_before, projector.parameters(), strict=True)
+        ),
+    )
+
+
+if __name__ == "__main__":
+    demo()
