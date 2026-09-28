@@ -52,6 +52,7 @@ VOCAB_SIZE = 512
 TEXT_SEED = 0
 VISION_SEED = 1
 PROJECTION_SEED = 0
+_SQRT_2_OVER_PI = sqrt(2.0 / 3.141592653589793)
 
 
 @dataclass
@@ -170,18 +171,21 @@ class MockVisionEncoder:
 
 def gelu(x: np.ndarray) -> np.ndarray:
     """Tanh-approximated GELU used between the two linear layers."""
-    inner = np.sqrt(2.0 / np.pi) * (x + 0.044715 * x**3)
+    inner = _SQRT_2_OVER_PI * (x + 0.044715 * x**3)
     return 0.5 * x * (1.0 + np.tanh(inner))
 
 
 def gelu_grad(x: np.ndarray) -> np.ndarray:
     """Derivative of the tanh-approximated GELU."""
-    scale = np.sqrt(2.0 / np.pi)
-    inner = scale * (x + 0.044715 * x**3)
+    inner = _SQRT_2_OVER_PI * (x + 0.044715 * x**3)
     tanh_inner = np.tanh(inner)
     return (
         0.5 * (1.0 + tanh_inner)
-        + 0.5 * x * (1.0 - tanh_inner**2) * scale * (1.0 + 3.0 * 0.044715 * x**2)
+        + 0.5
+        * x
+        * (1.0 - tanh_inner**2)
+        * _SQRT_2_OVER_PI
+        * (1.0 + 3.0 * 0.044715 * x**2)
     )
 
 
