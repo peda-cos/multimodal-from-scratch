@@ -312,6 +312,8 @@ def make_pair(
     """
     if vocab_size <= 0:
         raise ValueError("vocab_size must be positive")
+    if vocab_size < CAPTION_LEN:
+        raise ValueError("vocab_size must cover a unique synthetic caption")
     table = (
         text_table
         if text_table is not None

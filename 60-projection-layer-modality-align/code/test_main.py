@@ -228,6 +228,8 @@ class FixtureTests(unittest.TestCase):
         self.assertFalse(np.array_equal(first_tokens, third_tokens))
         self.assertTrue(np.all(first_ids >= 0))
         self.assertTrue(np.all(first_ids < 128))
+        with self.assertRaises(ValueError):
+            make_pair(0, CAPTION_LEN - 1)
 
     def test_cls_pool_returns_only_the_first_token(self) -> None:
         tokens = np.arange(2 * 3 * 4, dtype=np.float32).reshape(2, 3, 4)
