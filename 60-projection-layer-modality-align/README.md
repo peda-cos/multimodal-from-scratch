@@ -157,15 +157,15 @@ pretended to exist.
 ## Measured results
 
 Measured locally on CPU with the pinned environment. These are single-run
-numbers, not a benchmark claim; exact floats depend on the seeded fixture and
-BLAS implementation.
+numbers reported as observed, not a benchmark claim; reruns may differ
+slightly.
 
 - `./verify.sh`: **27 tests passed** (`Ran 27 tests`, `OK`); mypy reported
   `Success: no issues found in 5 source files`; the demo exited 0.
 - Test-suite wall time in the pinned venv: **0.357 s** on the first run and
   **0.471 s** on an immediate second run.
 - Full `./verify.sh` wall time: **4.32 s** on the first run and **8.42 s** on
-  the second; the difference is environment/load variance, not a benchmark.
+  the second; timing varies between runs, and neither number is a benchmark.
 - Demo input: 32 synthetic pairs, each `(197, 768)` image tokens and 6 caption
   ids; projection `768 -> 1024 -> 512`.
 - Trainable projector parameters: **1,312,256**.
@@ -178,10 +178,11 @@ BLAS implementation.
 - The demo reported frozen table, frozen bridge, and frozen image tokens
   unchanged (`True`), and projector parameters changed (`True`).
 
-The spec's illustrative trajectory is roughly `1.07 -> 0.80`; this
-implementation reaches a lower loss because the cosine gradient is the batch
-mean and SGD uses the full `lr=0.1` step. The qualitative claim is the same:
-the frozen modules stay fixed and only the projection moves.
+The spec's illustrative trajectory is roughly `1.07 -> 0.80`; the measured
+run here goes further. Exact trajectories depend on fixture and optimizer
+settings, so this README reports the observed numbers rather than asserting
+the spec's illustrative values. The qualitative claim is the same: the frozen
+modules stay fixed and only the projection moves.
 
 ## Limitations
 
