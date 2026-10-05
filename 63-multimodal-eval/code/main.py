@@ -2824,13 +2824,16 @@ def _print_metric_table(
         ("R@5 image->text", "retrieval_r5_i2t", 5.0 / n_samples),
         ("R@10 image->text", "retrieval_r10_i2t", 10.0 / n_samples),
         ("VQA exact match", "vqa_em", 1.0 / CONTENT_VOCAB),
-        ("BLEU-4", "bleu4", 0.0),
+        ("BLEU-4", "bleu4", float("nan")),
     )
     print(f"{'metric':<20} {'random':>8} {'before':>8} {'after':>8}")
     print("-" * 48)
     for label, key, baseline in rows:
+        baseline_text = (
+            "     n/a" if np.isnan(baseline) else f"{baseline:8.4f}"
+        )
         print(
-            f"{label:<20} {baseline:8.4f} "
+            f"{label:<20} {baseline_text} "
             f"{before[key]:8.4f} {after[key]:8.4f}"
         )
 

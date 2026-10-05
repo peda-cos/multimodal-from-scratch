@@ -52,7 +52,10 @@ search):
 | R@5 image → text | 0.1000 | 0.0800 | **0.7400** |
 | R@10 image → text | 0.2000 | 0.2200 | **0.9000** |
 | VQA exact match | 0.0156 | 0.0200 | **0.3800** |
-| BLEU-4 | 0.0000 | 0.0673 | **0.2673** |
+| BLEU-4 | n/a | 0.0673 | **0.2673** |
+
+BLEU has no closed-form random baseline; the before column is the untrained
+model's score against the suite references.
 
 Full-corpus training losses:
 
