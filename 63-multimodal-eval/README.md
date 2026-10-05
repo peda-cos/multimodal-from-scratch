@@ -278,14 +278,16 @@ its own tokenizer, so numbers are not comparable across tokenizations.
 
 ## Tests
 
-`code/test_main.py` contains 21 tests, including:
+`code/test_main.py` contains 21 detailed tests, and
+`code/tests/test_gate.py` adds 8 module-level contract tests that the portfolio
+gate counts separately. Together:
 
 - R@K identity, diagonal-worst, direction, `k = N`, and invalid-input cases.
 - Exact BLEU-4, disjoint vocabulary, add-one smoothing, multi-reference
   clipping, brevity penalty, and empty generation.
 - VQA exact-match fraction and input validation.
 - Suite counts, determinism, seed sensitivity, short-caption handling,
-  question/answer ranges, and invalid inputs.
+  question/answer ranges, held-out overlap, and invalid inputs.
 - Content-token rendering into the expected 2×2 patch.
 - Forward shapes, loss decomposition, finite head gradients, head-only loss
   reduction, bounded evaluation metrics, reproducible evaluation, and a short
